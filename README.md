@@ -2,6 +2,8 @@
 
 Web search extension for [pi](https://pi.dev) using the [Exa](https://exa.ai) API with automatic multi-key fallback on rate limits.
 
+![Exa Key Manager](screenshots/key-list.png)
+
 ## Features
 
 - **`web_search` tool** — search the web directly from pi conversations
@@ -55,6 +57,8 @@ Parameters:
 ### /exa command
 
 Interactive TUI for key management:
+
+![Key Actions](screenshots/key-actions.png)
 
 ```
 /exa
