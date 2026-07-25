@@ -1,55 +1,31 @@
-# Setup
+# Setup — @qmahyar/pi-exa-search
 
 ## Install
 
 ```bash
+pi install npm:@qmahyar/pi-exa-search
+```
+
+Or:
+
+```bash
 pi install git:github.com/QMahyar/pi-exa-search
 ```
 
-Or add to `~/.pi/agent/settings.json`:
+## API key
 
-```json
-{
-  "packages": ["git:github.com/QMahyar/pi-exa-search"]
-}
-```
+1. [dashboard.exa.ai/api-keys](https://dashboard.exa.ai/api-keys)  
+2. In pi: **`/exa`** → add key  
 
-Run `/reload` or restart pi.
-
-### Local / linked install (development)
+Or:
 
 ```bash
-# clone, then either:
-pi install git:github.com/QMahyar/pi-exa-search
-# or copy the extension for a quick test:
-cp extensions/web-search.ts ~/.pi/agent/extensions/
+export EXA_API_KEY=…
 ```
 
-If you already have a copy in `~/.pi/agent/extensions/web-search.ts`, prefer **one** source (package *or* local file) to avoid double-registering tools.
+Keys also live in `~/.pi/web-search.json`.
 
-## Get an Exa API Key
+## Related
 
-1. Sign up at [exa.ai](https://exa.ai)
-2. Open [API Keys](https://dashboard.exa.ai/api-keys)
-3. Create a key (format may be `exa_…` or a bare UUID depending on account)
-
-## Add the key to pi
-
-**Option A — TUI (recommended)**  
-Run `/exa` → **"+ Add new key"** → paste → optional label → optional test.
-
-**Option B — environment**
-
-```bash
-export EXA_API_KEY=your_key_here
-```
-
-Env is used as fallback when config keys are missing or on cooldown.
-
-**Option C — config file**  
-Edit `~/.pi/web-search.json` (see [usage.md](usage.md)).
-
-## Verify
-
-1. `/exa` → **⟳ Test top key** (or test a specific key)
-2. Ask pi something that needs current info — it should call `web_search`
+- [pi-9router](https://github.com/QMahyar/pi-9router) — multi-provider chat + tools via 9Router  
+- [Exa](https://exa.ai) · [pi.dev/packages](https://pi.dev/packages)

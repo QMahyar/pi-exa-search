@@ -1,15 +1,38 @@
 {
-  "name": "pi-exa-search",
-  "version": "1.1.0",
-  "description": "Web search + page fetch for pi powered by Exa — highlights, filters, multi-key rotation",
-  "keywords": ["pi-package", "pi", "extension", "search", "exa", "web-search", "web-fetch"],
+  "name": "@qmahyar/pi-exa-search",
+  "version": "1.0.0",
+  "description": "Exa neural web search and page fetch for pi — multi-key rotation, highlights, filters",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "exa",
+    "web-search",
+    "web-fetch",
+    "search"
+  ],
   "license": "MIT",
+  "author": "QMahyar",
+  "homepage": "https://github.com/QMahyar/pi-exa-search#readme",
+  "bugs": {
+    "url": "https://github.com/QMahyar/pi-exa-search/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/QMahyar/pi-exa-search.git"
+    "url": "git+https://github.com/QMahyar/pi-exa-search.git"
   },
+  "files": [
+    "extensions",
+    "docs",
+    "screenshots",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "image": "https://raw.githubusercontent.com/QMahyar/pi-exa-search/master/screenshots/key-list.png",
   "peerDependencies": {

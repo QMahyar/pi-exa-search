@@ -614,10 +614,10 @@ const WebFetchParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("exa", {
-		description: "Manage Exa API keys — add, remove, reorder, test via interactive TUI",
+		description: "Exa — manage API keys (add, reorder, test)",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui" && !ctx.hasUI) {
-				ctx.ui.notify(" /exa needs interactive UI", "error");
+				ctx.ui.notify("/exa needs interactive UI", "error");
 				return;
 			}
 			const result = await runExaKeysUI(ctx.ui);
@@ -631,16 +631,16 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "web_search",
-		label: "Web Search",
+		label: "Search",
 		description:
-			"Search the web via Exa (neural search). Returns relevant URLs with LLM-picked highlights. Use for current docs, news, facts, people, or companies. Prefer descriptive queries. Follow up with web_fetch on the best URLs when highlights are not enough.",
-		promptSnippet: "Search the web (Exa) for current information, docs, news, people, companies",
+			"Search the web with Exa neural search. Returns URLs and focused highlights. Best for current docs, news, facts, people, and companies. Prefer descriptive queries. Follow with web_fetch when you need full page text.",
+		promptSnippet: "Search the web with Exa (highlights)",
 		promptGuidelines: [
-			"Use web_search when you need up-to-date information from the web.",
-			"Write queries as a description of the ideal page, not bare keywords.",
-			"Use category for people/company/news/publication when relevant.",
-			"Use includeDomains for official docs (e.g. docs.python.org) instead of site: operators.",
-			"Default results use highlights (token-efficient). Call web_fetch on specific URLs for full content.",
+			"Call web_search for up-to-date information from the web.",
+			"Describe the ideal page in the query; avoid bare keyword lists.",
+			"Use category for people, company, news, or publication when it fits.",
+			"Use includeDomains for official docs instead of site: in the query.",
+			"Default results are highlights (token-efficient). Call web_fetch for full pages.",
 			"Use recencyFilter for news and recent changes.",
 		],
 		parameters: WebSearchParams,
@@ -734,13 +734,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "web_fetch",
-		label: "Web Fetch",
+		label: "Fetch",
 		description:
-			"Fetch clean page content for one or more known URLs via Exa. Use after web_search when highlights are insufficient, or to read a specific URL. Batch multiple URLs in one call.",
-		promptSnippet: "Fetch full content of web pages by URL (Exa)",
+			"Fetch clean page content for known URLs with Exa. Use after web_search when highlights are not enough, or to read a specific URL. Batch multiple URLs in one call.",
+		promptSnippet: "Fetch URL content with Exa",
 		promptGuidelines: [
-			"Use web_fetch when you already have URLs and need full content.",
-			"Batch related URLs in a single call instead of many sequential fetches.",
+			"Call web_fetch when you already have URLs and need full page content.",
+			"Batch related URLs in one call instead of many separate fetches.",
 			"Prefer web_search first when you do not know the URL yet.",
 		],
 		parameters: WebFetchParams,
