@@ -16,20 +16,40 @@ Or add to `~/.pi/agent/settings.json`:
 
 Run `/reload` or restart pi.
 
+### Local / linked install (development)
+
+```bash
+# clone, then either:
+pi install git:github.com/QMahyar/pi-exa-search
+# or copy the extension for a quick test:
+cp extensions/web-search.ts ~/.pi/agent/extensions/
+```
+
+If you already have a copy in `~/.pi/agent/extensions/web-search.ts`, prefer **one** source (package *or* local file) to avoid double-registering tools.
+
 ## Get an Exa API Key
 
 1. Sign up at [exa.ai](https://exa.ai)
-2. Go to Settings → API Keys
-3. Copy your key (starts with `exa_`)
+2. Open [API Keys](https://dashboard.exa.ai/api-keys)
+3. Create a key (format may be `exa_…` or a bare UUID depending on account)
 
-Free tier: 1,000 searches/month.
+## Add the key to pi
 
-## Add Key to Pi
+**Option A — TUI (recommended)**  
+Run `/exa` → **"+ Add new key"** → paste → optional label → optional test.
 
-Run `/exa` in pi → select **"+ Add new key"** → paste key → optional label.
+**Option B — environment**
 
-Multiple keys rotate automatically on rate limits.
+```bash
+export EXA_API_KEY=your_key_here
+```
+
+Env is used as fallback when config keys are missing or on cooldown.
+
+**Option C — config file**  
+Edit `~/.pi/web-search.json` (see [usage.md](usage.md)).
 
 ## Verify
 
-Ask pi anything that needs current info — it'll call `web_search` automatically.
+1. `/exa` → **⟳ Test top key** (or test a specific key)
+2. Ask pi something that needs current info — it should call `web_search`

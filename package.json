@@ -1,13 +1,17 @@
 {
   "name": "pi-exa-search",
-  "version": "1.0.0",
-  "description": "Web search for pi powered by Exa API — multi-key rotation and rate limit fallback",
-  "keywords": ["pi-package", "pi", "extension", "search", "exa", "web-search"],
+  "version": "1.1.0",
+  "description": "Web search + page fetch for pi powered by Exa — highlights, filters, multi-key rotation",
+  "keywords": ["pi-package", "pi", "extension", "search", "exa", "web-search", "web-fetch"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/QMahyar/pi-exa-search.git"
+  },
   "pi": {
     "extensions": ["./extensions"]
   },
-  "image": "https://raw.githubusercontent.com/QMahyar/pi-web-search/master/screenshots/key-list.png",
+  "image": "https://raw.githubusercontent.com/QMahyar/pi-exa-search/master/screenshots/key-list.png",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
