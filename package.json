@@ -1,0 +1,14 @@
+{
+  "name": "pi-web-search",
+  "version": "1.0.0",
+  "description": "Web search extension for pi using Exa API with multi-key fallback",
+  "keywords": ["pi-package", "pi", "extension", "search", "exa"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
