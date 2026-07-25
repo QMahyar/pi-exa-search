@@ -7,6 +7,7 @@
   "pi": {
     "extensions": ["./extensions"]
   },
+  "image": "https://raw.githubusercontent.com/QMahyar/pi-web-search/master/screenshots/key-list.png",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
