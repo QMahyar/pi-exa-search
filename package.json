@@ -1,8 +1,8 @@
 {
-  "name": "pi-web-search",
+  "name": "pi-exa-search",
   "version": "1.0.0",
-  "description": "Web search extension for pi using Exa API with multi-key fallback",
-  "keywords": ["pi-package", "pi", "extension", "search", "exa"],
+  "description": "Web search for pi powered by Exa API — multi-key rotation and rate limit fallback",
+  "keywords": ["pi-package", "pi", "extension", "search", "exa", "web-search"],
   "license": "MIT",
   "pi": {
     "extensions": ["./extensions"]
