@@ -16,11 +16,13 @@ Interactive key manager: add, reorder, test, remove. Supports multi-key fallback
 - Describe the ideal page, not keyword soup  
 - `category`, `includeDomains`, `recencyFilter` when useful  
 - Default is highlights; set `includeText` only if you need longer snippets  
+- Output is capped (~45KB / 2000 lines); oversized payloads are saved to a temp file and the path is reported  
 
 ### web_fetch tips
 
 - Absolute `http(s)` URLs, comma- or space-separated  
 - Batch several URLs in one call  
+- Total output is capped; overflow is saved to a temp file and the path is reported  
 
 ## Related
 

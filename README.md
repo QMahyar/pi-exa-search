@@ -43,6 +43,12 @@ pi install git:github.com/QMahyar/pi-exa-search
 | **`web_fetch`** | Full page content for known URLs (batch OK) |
 | **`/exa`** | TUI: add, reorder, test, remove API keys |
 | **Multi-key** | Auto-fallback on rate limits + cooldown |
+| **Safety** | Output capped at pi's limit; overflow saved to a temp file |
+
+> **Overrides pi's built-in web tools.** pi ships its own Exa-backed `web_search` / `web_fetch`.
+> This package registers the same names so it can add multi-key rotation and cooldown fallback —
+> interactive mode shows an "extension overrides built-in tool" warning on load, which is expected.
+> Prefer the built-ins? Disable this package's tools with `pi config`.
 
 <p align="center">
   <img src="screenshots/key-actions.png" alt="Key actions" width="420" />

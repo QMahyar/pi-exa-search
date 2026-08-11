@@ -8,22 +8,37 @@
  * Command:
  *   /exa        — interactive multi-key manager TUI
  *
- * Config: ~/.pi/web-search.json
+ * Config: ~/.pi/web-search.json (path uses CONFIG_DIR_NAME; file is chmod 0600)
  * Env:    EXA_API_KEY (used if no keys in config)
+ * Cooldowns are in-memory only (never persisted into the key list).
+ * Tool output is capped at pi's built-in limit; overflow goes to a temp file.
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	keyHint,
+	truncateHead,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type Theme,
+	type TruncationResult,
+} from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 // ── Config ──────────────────────────────────────────────────────
 
 interface KeyEntry {
 	key: string;
 	label?: string;
+	/** Legacy persisted cooldown — read for migration only, never written */
 	cooldownUntil?: number;
 }
 
@@ -33,8 +48,10 @@ interface Config {
 	exaApiKey?: string;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const CONFIG_PATH = join(homedir(), CONFIG_DIR_NAME, "web-search.json");
 const COOLDOWN_MS = 60_000;
+/** Keep tool output under pi's built-in 50KB / 2000-line cap (see extensions.md "Output Truncation") */
+const MAX_OUTPUT_BYTES = Math.floor(DEFAULT_MAX_BYTES * 0.9);
 const DEFAULT_SEARCH_MAX_CHARS = 2000;
 const DEFAULT_FETCH_MAX_CHARS = 5000;
 const MAX_RESULTS = 20;
@@ -55,26 +72,50 @@ type Category = (typeof CATEGORIES)[number];
 type SearchType = (typeof SEARCH_TYPES)[number];
 type Recency = (typeof RECENCY)[number];
 
+/** Runtime cooldowns only — deliberately never written to the key list file */
+const cooldowns = new Map<string, number>();
+let cachedConfig: Config | undefined;
+
 function loadConfig(): Config {
-	if (!existsSync(CONFIG_PATH)) return { keys: [] };
-	try {
-		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-		// Migrate legacy single-key field
-		if (raw.exaApiKey && (!raw.keys || raw.keys.length === 0)) {
-			return { keys: [{ key: raw.exaApiKey, label: "default" }] };
+	if (cachedConfig) return cachedConfig;
+	let cfg: Config = { keys: [] };
+	if (existsSync(CONFIG_PATH)) {
+		try {
+			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+			// Migrate legacy single-key field
+			if (raw.exaApiKey && (!raw.keys || raw.keys.length === 0)) {
+				cfg = { keys: [{ key: raw.exaApiKey, label: "default" }] };
+			} else {
+				cfg = { keys: Array.isArray(raw.keys) ? raw.keys : [] };
+			}
+		} catch {
+			cfg = { keys: [] };
 		}
-		return { keys: Array.isArray(raw.keys) ? raw.keys : [] };
-	} catch {
-		return { keys: [] };
 	}
+	// Migrate legacy persisted cooldowns into the runtime map, then forget them
+	const now = Date.now();
+	for (const k of cfg.keys) {
+		if (typeof k.cooldownUntil === "number" && k.cooldownUntil > now) {
+			cooldowns.set(k.key, k.cooldownUntil);
+		}
+		delete k.cooldownUntil;
+	}
+	cachedConfig = cfg;
+	return cfg;
 }
 
 function saveConfig(config: Config) {
 	const dir = dirname(CONFIG_PATH);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	// Never write deprecated field
-	const out: Config = { keys: config.keys };
-	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+	// Strip runtime-only + deprecated fields and lock permissions on the key file
+	const out: Config = { keys: config.keys.map(({ key, label }) => ({ key, label })) };
+	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
+	try {
+		chmodSync(CONFIG_PATH, 0o600);
+	} catch {
+		// best-effort on platforms without POSIX permissions
+	}
+	cachedConfig = config;
 }
 
 function maskedKey(key: string): string {
@@ -87,39 +128,30 @@ function envKey(): string | undefined {
 	return k || undefined;
 }
 
+function isCoolingDown(key: string, now = Date.now()): boolean {
+	const until = cooldowns.get(key);
+	if (!until) return false;
+	if (now >= until) {
+		cooldowns.delete(key);
+		return false;
+	}
+	return true;
+}
+
 /** Ordered keys: config (skip cooldown) then EXA_API_KEY env fallback */
 function availableKeys(config: Config): KeyEntry[] {
 	const now = Date.now();
-	const fromConfig = config.keys.filter((k) => {
-		if (!k.key?.trim()) return false;
-		if (!k.cooldownUntil) return true;
-		if (now >= k.cooldownUntil) {
-			k.cooldownUntil = undefined;
-			return true;
-		}
-		return false;
-	});
+	const fromConfig = config.keys.filter((k) => k.key?.trim() && !isCoolingDown(k.key, now));
 
 	const env = envKey();
-	if (env && !fromConfig.some((k) => k.key === env) && !config.keys.some((k) => k.key === env && k.cooldownUntil && now < k.cooldownUntil)) {
-		// Only add env if not already listed and not on cooldown under same key
-		const cool = config.keys.find((k) => k.key === env);
-		if (!cool || !cool.cooldownUntil || now >= cool.cooldownUntil) {
-			fromConfig.push({ key: env, label: "env:EXA_API_KEY" });
-		}
+	if (env && !fromConfig.some((k) => k.key === env) && !isCoolingDown(env, now)) {
+		fromConfig.push({ key: env, label: "env:EXA_API_KEY" });
 	}
 	return fromConfig;
 }
 
-function markCooldown(config: Config, key: string, ms: number) {
-	let entry = config.keys.find((k) => k.key === key);
-	if (!entry) {
-		// Env-only key: persist cooldown entry so we respect it
-		entry = { key, label: key === envKey() ? "env:EXA_API_KEY" : undefined };
-		config.keys.push(entry);
-	}
-	entry.cooldownUntil = Date.now() + ms;
-	saveConfig(config);
+function markCooldown(_config: Config, key: string, ms: number) {
+	cooldowns.set(key, Date.now() + ms);
 }
 
 // ── Exa HTTP ────────────────────────────────────────────────────
@@ -145,6 +177,8 @@ interface ExaSearchResponse {
 interface ExaContentsResponse {
 	results?: ExaResult[];
 	statuses?: Array<{ id: string; status: string; error?: string }>;
+	requestId?: string;
+	costDollars?: { total?: number };
 }
 
 type ExaOk<T> = { ok: true; data: T; usedKey: KeyEntry; status: number };
@@ -336,6 +370,41 @@ function toolOk(text: string, details: Record<string, unknown>) {
 	};
 }
 
+// ── Output trimming ─────────────────────────────────────────────
+
+async function saveFullOutput(text: string): Promise<string> {
+	const dir = await mkdtemp(join(tmpdir(), "pi-exa-"));
+	const file = join(dir, "output.txt");
+	await writeFile(file, text, "utf8");
+	return file;
+}
+
+/**
+ * Clamp tool output to pi's built-in cap (50KB / 2000 lines, whichever is hit first).
+ * When cut, the full payload is saved to a temp file and the LLM is told where.
+ */
+async function trimOutput(
+	body: string,
+): Promise<{ text: string; truncated?: TruncationResult; fullOutputPath?: string }> {
+	const tr = truncateHead(body, { maxLines: DEFAULT_MAX_LINES, maxBytes: MAX_OUTPUT_BYTES });
+	if (!tr.truncated) return { text: body };
+
+	// truncateHead never returns partial lines: a single line over the cap yields
+	// empty content, so fall back to a hard byte cut with an ellipsis.
+	let shown = tr.content;
+	if (!shown) {
+		shown = Buffer.from(body, "utf8").subarray(0, MAX_OUTPUT_BYTES).toString("utf8") + "\n…";
+	}
+
+	const fullOutputPath = await saveFullOutput(body);
+	const shownBytes = Buffer.byteLength(shown, "utf8");
+	const notice =
+		`\n\n[Output truncated: ${formatSize(shownBytes)} of ${formatSize(tr.totalBytes)} shown` +
+		` (${tr.totalLines} lines total). Full output saved to: ${fullOutputPath}]`;
+
+	return { text: shown + notice, truncated: tr, fullOutputPath };
+}
+
 // ── Compact TUI renderer ────────────────────────────────────────
 
 function renderSearchResult(
@@ -343,7 +412,11 @@ function renderSearchResult(
 	theme: Theme,
 	expanded: boolean,
 	textFallback: string,
+	isPartial = false,
 ): Text {
+	if (isPartial) {
+		return new Text(theme.fg("warning", "searching…"), 0, 0);
+	}
 	const query = typeof details?.query === "string" ? details.query : "";
 	const count = typeof details?.resultCount === "number" ? details.resultCount : 0;
 	const usedKey = typeof details?.usedKey === "string" ? details.usedKey : "";
@@ -354,7 +427,8 @@ function renderSearchResult(
 		const line = theme.fg("toolTitle", `web_search`) +
 			theme.fg("dim", ` · ${count} hit${count === 1 ? "" : "s"}`) +
 			(query ? theme.fg("muted", ` · ${q}`) : "") +
-			(usedKey ? theme.fg("dim", ` · ${usedKey}`) : "");
+			(usedKey ? theme.fg("dim", ` · ${usedKey}`) : "") +
+			theme.fg("dim", ` (${keyHint("app.tools.expand", "expand results")})`);
 		return new Text(line, 0, 0);
 	}
 
@@ -366,6 +440,9 @@ function renderSearchResult(
 		if (urls.length > 8) lines.push(theme.fg("dim", `… +${urls.length - 8} more`));
 	} else if (textFallback) {
 		lines.push(theme.fg("toolOutput", truncateToWidth(textFallback.replace(/\s+/g, " "), 200)));
+	}
+	if (typeof details?.fullOutputPath === "string") {
+		lines.push(theme.fg("dim", `Full output: ${details.fullOutputPath}`));
 	}
 	return new Text(lines.join("\n") || textFallback, 0, 0);
 }
@@ -388,6 +465,7 @@ async function testKey(ui: ExtensionContext["ui"], key: string): Promise<void> {
 				type: "instant",
 				contents: { highlights: true },
 			}),
+			signal: AbortSignal.timeout(10_000),
 		});
 		if (res.ok) {
 			ui.notify("Key works ✓", "info");
@@ -413,9 +491,10 @@ async function runExaKeysUI(ui: ExtensionContext["ui"]): Promise<string | null> 
 		const now = Date.now();
 		const env = envKey();
 		const items: string[] = keys.map((k, i) => {
+			const until = cooldowns.get(k.key);
 			const cd =
-				k.cooldownUntil && now < k.cooldownUntil
-					? ` [cooldown ${Math.ceil((k.cooldownUntil - now) / 1000)}s]`
+				typeof until === "number" && until > now
+					? ` [cooldown ${Math.ceil((until - now) / 1000)}s]`
 					: "";
 			return `${i + 1}. ${k.label || "unnamed"} — ${maskedKey(k.key)}${cd}`;
 		});
@@ -511,6 +590,7 @@ async function runExaKeysUI(ui: ExtensionContext["ui"]): Promise<string | null> 
 				);
 				if (yes) {
 					keys.splice(idx, 1);
+					cooldowns.delete(k.key);
 					save();
 					ui.notify("Key removed", "info");
 				}
@@ -633,7 +713,8 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Search",
 		description:
-			"Search the web with Exa neural search. Returns URLs and focused highlights. Best for current docs, news, facts, people, and companies. Prefer descriptive queries. Follow with web_fetch when you need full page text.",
+			"Search the web with Exa neural search. Returns URLs and focused highlights. Best for current docs, news, facts, people, and companies. Prefer descriptive queries. Follow with web_fetch when you need full page text. " +
+			`Output is capped at ~${formatSize(MAX_OUTPUT_BYTES)}; if a search exceeds that, the full output is saved to a temp file whose path is reported.`,
 		promptSnippet: "Search the web with Exa (highlights)",
 		promptGuidelines: [
 			"Call web_search for up-to-date information from the web.",
@@ -706,9 +787,10 @@ export default function (pi: ExtensionAPI) {
 
 			const results = result.data.results ?? [];
 			const usedKey = result.usedKey.label || maskedKey(result.usedKey.key);
-			const text = formatSearchOutput(query, results, { usedKey, includeText });
+			const fullText = formatSearchOutput(query, results, { usedKey, includeText });
+			const trimmed = await trimOutput(fullText);
 
-			return toolOk(text, {
+			return toolOk(trimmed.text, {
 				query,
 				resultCount: results.length,
 				usedKey,
@@ -717,16 +799,20 @@ export default function (pi: ExtensionAPI) {
 				includeText,
 				urls: results.map((r) => r.url),
 				titles: results.map((r) => r.title || r.url),
+				requestId: result.data.requestId ?? null,
+				costUsd: result.data.costDollars?.total ?? null,
+				truncated: trimmed.truncated ? true : undefined,
+				fullOutputPath: trimmed.fullOutputPath ?? undefined,
 			});
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded, isPartial }, theme) {
 			const text =
 				result.content
 					?.filter((c): c is { type: "text"; text: string } => c.type === "text")
 					.map((c) => c.text)
 					.join("\n") || "";
-			return renderSearchResult(result.details as Record<string, unknown> | undefined, theme, expanded, text);
+			return renderSearchResult(result.details as Record<string, unknown> | undefined, theme, expanded, text, isPartial);
 		},
 	});
 
@@ -736,7 +822,8 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Fetch",
 		description:
-			"Fetch clean page content for known URLs with Exa. Use after web_search when highlights are not enough, or to read a specific URL. Batch multiple URLs in one call.",
+			"Fetch clean page content for known URLs with Exa. Use after web_search when highlights are not enough, or to read a specific URL. Batch multiple URLs in one call. " +
+			`Total output is capped at ~${formatSize(MAX_OUTPUT_BYTES)}; if exceeded, the full payload is saved to a temp file whose path is reported.`,
 		promptSnippet: "Fetch URL content with Exa",
 		promptGuidelines: [
 			"Call web_fetch when you already have URLs and need full page content.",
@@ -805,31 +892,41 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const text =
+			const fullText =
 				`Fetch: ${results.length} page(s) · key: ${usedKey}\n\n` +
-				results
-					.map((r, i) => formatResult(r, i, { includeText: true }))
-					.join("\n\n---\n\n");
+				results.map((r, i) => formatResult(r, i, { includeText: true })).join("\n\n---\n\n");
+			const trimmed = await trimOutput(fullText);
 
-			return toolOk(text, {
+			return toolOk(trimmed.text, {
 				urlCount: results.length,
 				usedKey,
 				urls: results.map((r) => r.url),
 				titles: results.map((r) => r.title || r.url),
+				requestId: result.data.requestId ?? null,
+				costUsd: result.data.costDollars?.total ?? null,
+				truncated: trimmed.truncated ? true : undefined,
+				fullOutputPath: trimmed.fullOutputPath ?? undefined,
 			});
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded, isPartial }, theme) {
+			if (isPartial) {
+				return new Text(theme.fg("warning", "fetching…"), 0, 0);
+			}
 			const details = (result.details || {}) as Record<string, unknown>;
 			const count = typeof details.urlCount === "number" ? details.urlCount : 0;
 			const urls = Array.isArray(details.urls) ? (details.urls as string[]) : [];
 			if (!expanded) {
 				const line =
 					theme.fg("toolTitle", "web_fetch") +
-					theme.fg("dim", ` · ${count || urls.length} page${(count || urls.length) === 1 ? "" : "s"}`);
+					theme.fg("dim", ` · ${count || urls.length} page${(count || urls.length) === 1 ? "" : "s"}`) +
+					theme.fg("dim", ` (${keyHint("app.tools.expand", "expand")})`);
 				return new Text(line, 0, 0);
 			}
 			const lines = urls.slice(0, 10).map((u) => theme.fg("muted", `• ${u}`));
+			if (typeof details.fullOutputPath === "string") {
+				lines.push(theme.fg("dim", `Full output: ${details.fullOutputPath}`));
+			}
 			return new Text(lines.join("\n") || "fetched", 0, 0);
 		},
 	});
