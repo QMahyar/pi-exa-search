@@ -1,6 +1,6 @@
 {
   "name": "@qmahyar/pi-exa-search",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Exa neural web search and page fetch for pi — multi-key rotation, highlights, filters",
   "keywords": [
     "pi-package",
@@ -35,9 +35,26 @@
     ],
     "image": "https://raw.githubusercontent.com/QMahyar/pi-exa-search/master/screenshots/key-list.png"
   },
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^26.2.0",
+    "typebox": "^1.3.16",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   }
 }

@@ -25,7 +25,6 @@ export EXA_API_KEY=…
 
 Keys also live in `~/.pi/web-search.json`.
 
-## Related
+## Links
 
-- [pi-9router](https://github.com/QMahyar/pi-9router) — multi-provider chat + tools via 9Router  
 - [Exa](https://exa.ai) · [pi.dev/packages](https://pi.dev/packages)

@@ -3,14 +3,24 @@
  *
  * Tools:
  *   web_search  — neural search with highlights (token-efficient)
- *   web_fetch   — full page content for known URLs
+ *   web_fetch   — full page content for known URLs (live-crawl aware)
  *
  * Command:
  *   /exa        — interactive multi-key manager TUI
  *
- * Config: ~/.pi/web-search.json (path uses CONFIG_DIR_NAME; file is chmod 0600)
- * Env:    EXA_API_KEY (used if no keys in config)
- * Cooldowns are in-memory only (never persisted into the key list).
+ * Config: ~/.pi/web-search.json (path uses CONFIG_DIR_NAME; file chmod 0600).
+ *         Override with PI_WEB_SEARCH_CONFIG (advanced/testing).
+ * Env:    EXA_API_KEY (fallback key if none configured)
+ *         PI_EXA_TIMEOUT_MS (per-request timeout, default 30000)
+ *
+ * Key rotation policy:
+ *   429      → cooldown per Retry-After (max 5 min, default 60s), next key
+ *   401/403  → 60 min cooldown (likely invalid key), next key
+ *   402      → 10 min cooldown (out of credits), next key
+ *   5xx/408  → retry same key with backoff (300ms, 900ms), then next key
+ *   Cooldowns are in-memory only (never persisted into the key list).
+ *
+ * Errors are thrown from execute (pi converts throws to error tool results).
  * Tool output is capped at pi's built-in limit; overflow goes to a temp file.
  */
 
@@ -26,6 +36,7 @@ import {
 	type Theme,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
@@ -48,15 +59,26 @@ interface Config {
 	exaApiKey?: string;
 }
 
-const CONFIG_PATH = join(homedir(), CONFIG_DIR_NAME, "web-search.json");
+function configPath(): string {
+	return process.env.PI_WEB_SEARCH_CONFIG || join(homedir(), CONFIG_DIR_NAME, "web-search.json");
+}
+
 const COOLDOWN_MS = 60_000;
+const COOLDOWN_401_MS = 60 * 60_000;
+const COOLDOWN_402_MS = 10 * 60_000;
+const COOLDOWN_MAX_MS = 5 * 60_000;
 /** Keep tool output under pi's built-in 50KB / 2000-line cap (see extensions.md "Output Truncation") */
 const MAX_OUTPUT_BYTES = Math.floor(DEFAULT_MAX_BYTES * 0.9);
 const DEFAULT_SEARCH_MAX_CHARS = 2000;
 const DEFAULT_FETCH_MAX_CHARS = 5000;
 const MAX_RESULTS = 20;
+const REQUEST_TIMEOUT_MS = Math.max(1_000, Number(process.env.PI_EXA_TIMEOUT_MS) || 30_000);
+const RETRY_BACKOFF_MS = [300, 900];
 
-const CATEGORIES = [
+const RECENCY = ["day", "week", "month", "year"] as const;
+/** Current Exa `type` values; deep-* are slower/costlier but more thorough */
+const SEARCH_TYPES = ["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"] as const;
+const KNOWN_CATEGORIES = [
 	"company",
 	"people",
 	"publication",
@@ -65,12 +87,8 @@ const CATEGORIES = [
 	"financial report",
 ] as const;
 
-const SEARCH_TYPES = ["auto", "fast", "instant"] as const;
-const RECENCY = ["day", "week", "month", "year"] as const;
-
-type Category = (typeof CATEGORIES)[number];
-type SearchType = (typeof SEARCH_TYPES)[number];
 type Recency = (typeof RECENCY)[number];
+type SearchType = (typeof SEARCH_TYPES)[number];
 
 /** Runtime cooldowns only — deliberately never written to the key list file */
 const cooldowns = new Map<string, number>();
@@ -79,9 +97,10 @@ let cachedConfig: Config | undefined;
 function loadConfig(): Config {
 	if (cachedConfig) return cachedConfig;
 	let cfg: Config = { keys: [] };
-	if (existsSync(CONFIG_PATH)) {
+	const path = configPath();
+	if (existsSync(path)) {
 		try {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+			const raw = JSON.parse(readFileSync(path, "utf-8"));
 			// Migrate legacy single-key field
 			if (raw.exaApiKey && (!raw.keys || raw.keys.length === 0)) {
 				cfg = { keys: [{ key: raw.exaApiKey, label: "default" }] };
@@ -105,13 +124,14 @@ function loadConfig(): Config {
 }
 
 function saveConfig(config: Config) {
-	const dir = dirname(CONFIG_PATH);
+	const path = configPath();
+	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 	// Strip runtime-only + deprecated fields and lock permissions on the key file
 	const out: Config = { keys: config.keys.map(({ key, label }) => ({ key, label })) };
-	writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
+	writeFileSync(path, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
 	try {
-		chmodSync(CONFIG_PATH, 0o600);
+		chmodSync(path, 0o600);
 	} catch {
 		// best-effort on platforms without POSIX permissions
 	}
@@ -123,19 +143,26 @@ function maskedKey(key: string): string {
 	return key.slice(0, 10) + "..." + key.slice(-4);
 }
 
+function formatDuration(ms: number): string {
+	const s = Math.max(1, Math.ceil(ms / 1000));
+	if (s < 90) return `${s}s`;
+	const m = Math.ceil(s / 60);
+	if (m < 90) return `${m}m`;
+	return `${Math.ceil(m / 60)}h`;
+}
+
 function envKey(): string | undefined {
 	const k = process.env.EXA_API_KEY?.trim();
 	return k || undefined;
 }
 
-function isCoolingDown(key: string, now = Date.now()): boolean {
+function cooldownRemaining(key: string, now = Date.now()): number {
 	const until = cooldowns.get(key);
-	if (!until) return false;
-	if (now >= until) {
-		cooldowns.delete(key);
-		return false;
-	}
-	return true;
+	return typeof until === "number" && until > now ? until - now : 0;
+}
+
+function isCoolingDown(key: string, now = Date.now()): boolean {
+	return cooldownRemaining(key, now) > 0;
 }
 
 /** Ordered keys: config (skip cooldown) then EXA_API_KEY env fallback */
@@ -150,7 +177,7 @@ function availableKeys(config: Config): KeyEntry[] {
 	return fromConfig;
 }
 
-function markCooldown(_config: Config, key: string, ms: number) {
+function markCooldown(key: string, ms: number) {
 	cooldowns.set(key, Date.now() + ms);
 }
 
@@ -166,6 +193,8 @@ interface ExaResult {
 	highlights?: string[];
 	summary?: string;
 	score?: number;
+	/** Nested pages crawled via the subpages option (carry their own text) */
+	subpages?: ExaResult[];
 }
 
 interface ExaSearchResponse {
@@ -184,6 +213,31 @@ interface ExaContentsResponse {
 type ExaOk<T> = { ok: true; data: T; usedKey: KeyEntry; status: number };
 type ExaFail = { ok: false; lastError: string; tried: number };
 
+function isTransientStatus(status: number): boolean {
+	return status >= 500 || status === 408 || status === 425;
+}
+
+function combinedSignal(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/** setTimeout-based sleep that resolves early if signal aborts */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) return resolve();
+		const t = setTimeout(resolve, ms);
+		signal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(t);
+				resolve();
+			},
+			{ once: true },
+		);
+	});
+}
+
 async function exaRequest<T>(
 	path: string,
 	body: Record<string, unknown>,
@@ -191,89 +245,108 @@ async function exaRequest<T>(
 	onStatus?: (msg: string) => void,
 ): Promise<ExaOk<T> | ExaFail> {
 	const config = loadConfig();
-	// Clear expired cooldowns and persist once if needed
 	const keys = availableKeys(config);
 	if (keys.length === 0) {
-		const total = config.keys.length + (envKey() ? 1 : 0);
-		return {
-			ok: false,
-			tried: 0,
-			lastError: [
-				"No Exa API keys available.",
-				"Run /exa to add a key, set EXA_API_KEY, or get one at https://dashboard.exa.ai/api-keys",
-				`Configured keys: ${config.keys.length}${config.keys.length > 0 ? " (all on cooldown)" : ""}${envKey() ? " + env" : ""}`,
-				total === 0 ? "" : "",
-			]
+		const lines = [
+			"No Exa API keys available.",
+			"Run /exa to add a key, set EXA_API_KEY, or get one at https://dashboard.exa.ai/api-keys",
+		];
+		if (config.keys.length > 0 || envKey()) {
+			const remaining = [...config.keys.map((k) => k.key), envKey()]
 				.filter(Boolean)
-				.join("\n"),
-		};
+				.map((k) => cooldownRemaining(k as string))
+				.reduce((a, b) => Math.max(a, b), 0);
+			lines.push(
+				`Configured: ${config.keys.length} key(s)${envKey() ? " + env" : ""} — all on cooldown (longest ${formatDuration(remaining)}).`,
+			);
+		}
+		return { ok: false, tried: 0, lastError: lines.join("\n") };
 	}
 
 	let lastError = "";
 	for (let i = 0; i < keys.length; i++) {
 		const keyEntry = keys[i];
-		if (signal?.aborted) {
-			return { ok: false, tried: i, lastError: "aborted" };
-		}
+		let attempt = 0;
 
-		onStatus?.(
-			keys.length > 1
-				? `Exa ${path} via ${keyEntry.label || maskedKey(keyEntry.key)} (${i + 1}/${keys.length})…`
-				: `Exa ${path}…`,
-		);
-
-		try {
-			const res = await fetch(`https://api.exa.ai${path}`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					// Both headers accepted by Exa; Bearer is preferred in current docs
-					Authorization: `Bearer ${keyEntry.key}`,
-					"x-api-key": keyEntry.key,
-				},
-				body: JSON.stringify(body),
-				signal,
-			});
-
-			if (res.status === 429) {
-				const retryAfter = Number(res.headers.get("retry-after"));
-				const coolMs = Number.isFinite(retryAfter) && retryAfter > 0
-					? Math.min(retryAfter * 1000, 5 * 60_000)
-					: COOLDOWN_MS;
-				markCooldown(config, keyEntry.key, coolMs);
-				lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" rate limited (cooldown ${Math.round(coolMs / 1000)}s)`;
-				continue;
+		while (true) {
+			if (signal?.aborted) {
+				return { ok: false, tried: i, lastError: "aborted" };
 			}
 
-			if (res.status === 401 || res.status === 403) {
-				lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" unauthorized (${res.status})`;
-				// Don't burn remaining keys on a likely global issue, but try next in case of bad key
-				continue;
-			}
+			onStatus?.(
+				keys.length > 1
+					? `Exa ${path} via ${keyEntry.label || maskedKey(keyEntry.key)} (${i + 1}/${keys.length})${attempt > 0 ? ` · retry ${attempt}` : ""}…`
+					: `Exa ${path}${attempt > 0 ? ` (retry ${attempt})` : ""}…`,
+			);
 
-			if (res.status === 402) {
-				lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" payment required (402) — check Exa plan/credits`;
-				continue;
-			}
+			try {
+				const res = await fetch(`https://api.exa.ai${path}`, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"x-api-key": keyEntry.key,
+					},
+					body: JSON.stringify(body),
+					signal: combinedSignal(signal),
+				});
 
-			if (!res.ok) {
-				const errText = (await res.text()).slice(0, 300);
-				lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" failed (${res.status}): ${errText}`;
-				// 4xx on body (bad params) — don't rotate forever
-				if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+				if (res.status === 429) {
+					const retryAfter = Number(res.headers.get("retry-after"));
+					const coolMs =
+						Number.isFinite(retryAfter) && retryAfter > 0
+							? Math.min(retryAfter * 1000, COOLDOWN_MAX_MS)
+							: COOLDOWN_MS;
+					markCooldown(keyEntry.key, coolMs);
+					lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" rate limited (cooldown ${formatDuration(coolMs)})`;
+					break; // next key
+				}
+
+				if (res.status === 401 || res.status === 403) {
+					markCooldown(keyEntry.key, COOLDOWN_401_MS);
+					lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" unauthorized (${res.status}, cooldown ${formatDuration(COOLDOWN_401_MS)})`;
+					break; // next key
+				}
+
+				if (res.status === 402) {
+					markCooldown(keyEntry.key, COOLDOWN_402_MS);
+					lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" payment required (402 — check Exa plan/credits, cooldown ${formatDuration(COOLDOWN_402_MS)})`;
+					break; // next key
+				}
+
+				if (!res.ok) {
+					const errText = (await res.text()).slice(0, 300);
+					lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" failed (${res.status}): ${errText}`;
+					if (isTransientStatus(res.status)) {
+						if (attempt < RETRY_BACKOFF_MS.length) {
+							await sleep(RETRY_BACKOFF_MS[attempt], signal);
+							attempt++;
+							continue;
+						}
+						break; // next key
+					}
+					// Non-transient 4xx: the request itself is bad — don't rotate keys
 					return { ok: false, tried: i + 1, lastError };
 				}
-				continue;
-			}
 
-			const data = (await res.json()) as T;
-			return { ok: true, data, usedKey: keyEntry, status: res.status };
-		} catch (err: any) {
-			if (signal?.aborted || err?.name === "AbortError") {
-				return { ok: false, tried: i + 1, lastError: "aborted" };
+				const data = (await res.json()) as T;
+				return { ok: true, data, usedKey: keyEntry, status: res.status };
+			} catch (err: any) {
+				if (signal?.aborted) {
+					return { ok: false, tried: i + 1, lastError: "aborted" };
+				}
+				if (err?.name === "AbortError") {
+					// Our own timeout fired (caller signal is still live)
+					lastError = `Key "${keyEntry.label || maskedKey(keyEntry.key)}" timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s`;
+				} else {
+					lastError = err?.message || String(err);
+				}
+				if (attempt < RETRY_BACKOFF_MS.length) {
+					await sleep(RETRY_BACKOFF_MS[attempt], signal);
+					attempt++;
+					continue;
+				}
+				break; // next key
 			}
-			lastError = err?.message || String(err);
-			continue;
 		}
 	}
 
@@ -310,6 +383,15 @@ function parseDomainList(value?: string): string[] | undefined {
 	return list.length ? list : undefined;
 }
 
+function parseList(value?: string): string[] | undefined {
+	if (!value?.trim()) return undefined;
+	const list = value
+		.split(/[,\s]+/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+	return list.length ? list : undefined;
+}
+
 function formatResult(r: ExaResult, index: number, opts: { includeText: boolean }): string {
 	const title = r.title?.trim() || r.url;
 	const lines: string[] = [`### ${index + 1}. ${title}`, r.url];
@@ -339,6 +421,17 @@ function formatResult(r: ExaResult, index: number, opts: { includeText: boolean 
 		}
 	}
 
+	if (r.subpages?.length) {
+		lines.push("", "**Subpages:**");
+		for (const sp of r.subpages) {
+			const spTitle = sp.title?.trim() || sp.url;
+			lines.push(`#### ${spTitle}`, sp.url);
+			if (opts.includeText && sp.text?.trim()) {
+				lines.push(sp.text.trim());
+			}
+		}
+	}
+
 	return lines.join("\n");
 }
 
@@ -353,14 +446,6 @@ function formatSearchOutput(
 	const header = `Search: ${query}\nResults: ${results.length} · key: ${meta.usedKey}`;
 	const body = results.map((r, i) => formatResult(r, i, { includeText: meta.includeText })).join("\n\n---\n\n");
 	return `${header}\n\n${body}`;
-}
-
-function toolError(message: string, details: Record<string, unknown> = {}) {
-	return {
-		content: [{ type: "text" as const, text: message }],
-		details,
-		isError: true as const,
-	};
 }
 
 function toolOk(text: string, details: Record<string, unknown>) {
@@ -407,6 +492,15 @@ async function trimOutput(
 
 // ── Compact TUI renderer ────────────────────────────────────────
 
+/** keyHint reads the global keybinding config; outside the TUI it can throw — fall back to plain text */
+function safeKeyHint(action: Parameters<typeof keyHint>[0], fallback: string): string {
+	try {
+		return keyHint(action, fallback);
+	} catch {
+		return fallback;
+	}
+}
+
 function renderSearchResult(
 	details: Record<string, unknown> | undefined,
 	theme: Theme,
@@ -428,7 +522,7 @@ function renderSearchResult(
 			theme.fg("dim", ` · ${count} hit${count === 1 ? "" : "s"}`) +
 			(query ? theme.fg("muted", ` · ${q}`) : "") +
 			(usedKey ? theme.fg("dim", ` · ${usedKey}`) : "") +
-			theme.fg("dim", ` (${keyHint("app.tools.expand", "expand results")})`);
+			theme.fg("dim", ` (${safeKeyHint("app.tools.expand", "expand results")})`);
 		return new Text(line, 0, 0);
 	}
 
@@ -456,7 +550,6 @@ async function testKey(ui: ExtensionContext["ui"], key: string): Promise<void> {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				Authorization: `Bearer ${key}`,
 				"x-api-key": key,
 			},
 			body: JSON.stringify({
@@ -491,11 +584,8 @@ async function runExaKeysUI(ui: ExtensionContext["ui"]): Promise<string | null> 
 		const now = Date.now();
 		const env = envKey();
 		const items: string[] = keys.map((k, i) => {
-			const until = cooldowns.get(k.key);
-			const cd =
-				typeof until === "number" && until > now
-					? ` [cooldown ${Math.ceil((until - now) / 1000)}s]`
-					: "";
+			const remaining = cooldownRemaining(k.key, now);
+			const cd = remaining > 0 ? ` [cooldown ${formatDuration(remaining)}]` : "";
 			return `${i + 1}. ${k.label || "unnamed"} — ${maskedKey(k.key)}${cd}`;
 		});
 		if (env) {
@@ -627,16 +717,13 @@ const WebSearchParams = Type.Object({
 		}),
 	),
 	recencyFilter: Type.Optional(
-		Type.String({
+		StringEnum([...RECENCY], {
 			description: "Only results published within this window: day, week, month, year",
-			enum: [...RECENCY],
 		}),
 	),
 	category: Type.Optional(
 		Type.String({
-			description:
-				"Focus results: company, people, publication, news, personal site, financial report. Note: company/people do not support recency or excludeDomains.",
-			enum: [...CATEGORIES],
+			description: `Focus results. Known categories: ${KNOWN_CATEGORIES.join(", ")}. Other short strings are treated as category hints. Note: company/people do not support recencyFilter or excludeDomains.`,
 		}),
 	),
 	includeDomains: Type.Optional(
@@ -651,9 +738,9 @@ const WebSearchParams = Type.Object({
 		}),
 	),
 	type: Type.Optional(
-		Type.String({
-			description: "Search latency/quality: auto (default), fast, instant",
-			enum: [...SEARCH_TYPES],
+		StringEnum([...SEARCH_TYPES], {
+			description:
+				"Search mode: auto (default), fast, instant, or deep-lite/deep/deep-reasoning for harder research (slower and costlier).",
 		}),
 	),
 	includeText: Type.Optional(
@@ -688,6 +775,27 @@ const WebFetchParams = Type.Object({
 			description: "Optional focus query for highlights extraction on each page",
 		}),
 	),
+	maxAgeHours: Type.Optional(
+		Type.Integer({
+			description:
+				"Cache freshness: -1 = cached only (fastest), 0 = always live-crawl (freshest, slowest), N = use cache if newer than N hours, else live-crawl. Default: live-crawl only when no cached copy exists.",
+			minimum: -1,
+			maximum: 720,
+		}),
+	),
+	subpages: Type.Optional(
+		Type.Integer({
+			description:
+				"Also crawl up to N linked subpages of each URL (e.g. docs sections). Multiplies cost — use sparingly. Max 10.",
+			minimum: 1,
+			maximum: 10,
+		}),
+	),
+	subpageTarget: Type.Optional(
+		Type.String({
+			description: "Comma-separated section names to target when subpages is set (e.g. 'docs, api, reference').",
+		}),
+	),
 });
 
 // ── Extension ───────────────────────────────────────────────────
@@ -717,20 +825,21 @@ export default function (pi: ExtensionAPI) {
 			`Output is capped at ~${formatSize(MAX_OUTPUT_BYTES)}; if a search exceeds that, the full output is saved to a temp file whose path is reported.`,
 		promptSnippet: "Search the web with Exa (highlights)",
 		promptGuidelines: [
-			"Call web_search for up-to-date information from the web.",
-			"Describe the ideal page in the query; avoid bare keyword lists.",
-			"Use category for people, company, news, or publication when it fits.",
-			"Use includeDomains for official docs instead of site: in the query.",
-			"Default results are highlights (token-efficient). Call web_fetch for full pages.",
-			"Use recencyFilter for news and recent changes.",
+			"Use web_search for up-to-date information from the web.",
+			"Write web_search queries as a description of the ideal page; avoid bare keyword lists.",
+			"Pass category to web_search for people, company, news, or publication results.",
+			"Pass includeDomains to web_search for official docs instead of site: in the query.",
+			"web_search returns highlights by default (token-efficient); call web_fetch for full pages.",
+			"Pass recencyFilter to web_search for news and recent changes.",
+			"Pass type='deep*' to web_search only for hard research questions; it is slower and costlier.",
 		],
 		parameters: WebSearchParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, _ctx) {
 			const query = params.query?.trim();
-			if (!query) return toolError("query is required");
+			if (!query) throw new Error("web_search: query is required");
 
-			const category = params.category as Category | undefined;
+			const category = params.category?.trim() || undefined;
 			const recency = params.recencyFilter as Recency | undefined;
 			const searchType = (params.type as SearchType | undefined) || "auto";
 			const includeText = params.includeText === true;
@@ -775,13 +884,12 @@ export default function (pi: ExtensionAPI) {
 
 			if (!result.ok) {
 				if (result.lastError === "aborted") {
-					return toolError("Search aborted.", { query });
+					throw new Error("web_search: aborted");
 				}
-				return toolError(
+				throw new Error(
 					result.tried === 0
-						? result.lastError
-						: `Search failed after ${result.tried} key(s).\n${result.lastError}`,
-					{ query, error: result.lastError },
+						? `web_search: ${result.lastError}`
+						: `web_search failed after ${result.tried} key(s).\n${result.lastError}`,
 				);
 			}
 
@@ -822,13 +930,14 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Fetch",
 		description:
-			"Fetch clean page content for known URLs with Exa. Use after web_search when highlights are not enough, or to read a specific URL. Batch multiple URLs in one call. " +
+			"Fetch clean page content for known URLs with Exa (live-crawls pages not in its cache by default). Use after web_search when highlights are not enough, or to read a specific URL. Batch multiple URLs in one call. " +
 			`Total output is capped at ~${formatSize(MAX_OUTPUT_BYTES)}; if exceeded, the full payload is saved to a temp file whose path is reported.`,
 		promptSnippet: "Fetch URL content with Exa",
 		promptGuidelines: [
 			"Call web_fetch when you already have URLs and need full page content.",
-			"Batch related URLs in one call instead of many separate fetches.",
-			"Prefer web_search first when you do not know the URL yet.",
+			"Batch related URLs into a single web_fetch call instead of many separate fetches.",
+			"Use web_search first when you do not know the URL yet.",
+			"Pass subpages to web_fetch to pull key sections of a docs site in one call.",
 		],
 		parameters: WebFetchParams,
 
@@ -840,9 +949,8 @@ export default function (pi: ExtensionAPI) {
 				.filter((s) => /^https?:\/\//i.test(s));
 
 			if (!urlList.length) {
-				return toolError(
-					"No valid URLs. Pass absolute URLs starting with http:// or https://, separated by commas or spaces.",
-					{ urls: raw },
+				throw new Error(
+					"web_fetch: no valid URLs. Pass absolute URLs starting with http:// or https://, separated by commas or spaces.",
 				);
 			}
 
@@ -854,6 +962,12 @@ export default function (pi: ExtensionAPI) {
 					? { query: params.highlightsQuery }
 					: true,
 			};
+			if (params.maxAgeHours !== undefined) body.maxAgeHours = params.maxAgeHours;
+			const subpageTarget = parseList(params.subpageTarget);
+			if (params.subpages !== undefined) {
+				body.subpages = params.subpages;
+				if (subpageTarget) body.subpageTarget = subpageTarget;
+			}
 
 			onUpdate?.({
 				content: [{ type: "text", text: `Fetching ${urlList.length} URL(s)…` }],
@@ -869,13 +983,12 @@ export default function (pi: ExtensionAPI) {
 
 			if (!result.ok) {
 				if (result.lastError === "aborted") {
-					return toolError("Fetch aborted.", { urls: urlList });
+					throw new Error("web_fetch: aborted");
 				}
-				return toolError(
+				throw new Error(
 					result.tried === 0
-						? result.lastError
-						: `Fetch failed after ${result.tried} key(s).\n${result.lastError}`,
-					{ urls: urlList, error: result.lastError },
+						? `web_fetch: ${result.lastError}`
+						: `web_fetch failed after ${result.tried} key(s).\n${result.lastError}`,
 				);
 			}
 
@@ -886,9 +999,8 @@ export default function (pi: ExtensionAPI) {
 				const statuses = result.data.statuses
 					?.map((s) => `- ${s.id}: ${s.status}${s.error ? ` (${s.error})` : ""}`)
 					.join("\n");
-				return toolError(
-					`No content returned for ${urlList.length} URL(s).${statuses ? `\n${statuses}` : ""}`,
-					{ urls: urlList, usedKey },
+				throw new Error(
+					`web_fetch: no content returned for ${urlList.length} URL(s).${statuses ? `\n${statuses}` : ""}`,
 				);
 			}
 
@@ -920,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 				const line =
 					theme.fg("toolTitle", "web_fetch") +
 					theme.fg("dim", ` · ${count || urls.length} page${(count || urls.length) === 1 ? "" : "s"}`) +
-					theme.fg("dim", ` (${keyHint("app.tools.expand", "expand")})`);
+					theme.fg("dim", ` (${safeKeyHint("app.tools.expand", "expand")})`);
 				return new Text(line, 0, 0);
 			}
 			const lines = urls.slice(0, 10).map((u) => theme.fg("muted", `• ${u}`));

@@ -8,7 +8,7 @@
 
 <p align="center">
   <strong>Neural web search for pi.</strong><br />
-  Token-efficient highlights, page fetch, multi-key rotation, and a simple <code>/exa</code> key manager.
+  Token-efficient highlights, page fetch with live-crawl + subpages, multi-key rotation, and a simple <code>/exa</code> key manager.
 </p>
 
 <p align="center">
@@ -39,10 +39,11 @@ pi install git:github.com/QMahyar/pi-exa-search
 
 | Piece | Role |
 |-------|------|
-| **`web_search`** | Exa neural search with **highlights** (cheap on context) |
-| **`web_fetch`** | Full page content for known URLs (batch OK) |
+| **`web_search`** | Exa neural search with **highlights** (cheap on context), filters, deep-search modes |
+| **`web_fetch`** | Clean page content for known URLs (batch OK) — live-crawls pages not in Exa's cache, can pull **subpages** |
 | **`/exa`** | TUI: add, reorder, test, remove API keys |
-| **Multi-key** | Auto-fallback on rate limits + cooldown |
+| **Multi-key** | Auto-fallback with per-status cooldowns (429 → Retry-After, 401/403 → 1h, 402 → 10m) |
+| **Resilience** | 30s per-request timeout, retry with backoff on 5xx/network errors before rotating keys |
 | **Safety** | Output capped at pi's limit; overflow saved to a temp file |
 
 > **Overrides pi's built-in web tools.** pi ships its own Exa-backed `web_search` / `web_fetch`.
@@ -60,25 +61,13 @@ pi install git:github.com/QMahyar/pi-exa-search
 2. In pi: **`/exa`** → add key (or set `EXA_API_KEY`)  
 3. Ask for current docs / news — the agent calls `web_search` / `web_fetch`
 
-## Pair with 9Router (optional)
-
-For multi-provider **chat** models plus image, speech, and gateway web tools:
-
-```bash
-pi install npm:@qmahyar/pi-9router
-```
-
-→ [**@qmahyar/pi-9router**](https://github.com/QMahyar/pi-9router) · [npm](https://www.npmjs.com/package/@qmahyar/pi-9router)
-
-If you use both packages, disable overlapping web tools in one of them so the agent has a single clear search path.
-
 ## Docs
 
 | Doc | |
 |-----|--|
 | [Setup](docs/setup.md) | Install & API keys |
 | [Usage](docs/usage.md) | Parameters & tips |
-| [Dev](docs/dev.md) | Architecture |
+| [Dev](docs/dev.md) | Architecture & tests |
 
 ## Links
 
